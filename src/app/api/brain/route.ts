@@ -34,9 +34,13 @@ import { hydrateBoardItemsMedia } from "@/lib/mediaResolver";
 import {
   MOMO_MODEL_CATALOG,
   normalizeReasoningEffort,
+  providerOf,
   resolveModelMeta,
+  type MomoModelOption,
   type ReasoningEffort,
 } from "@/lib/modelCatalog";
+import { streamFromLocalProvider, titleFromRouter } from "@/lib/providers/localProviders";
+import { appToolsDirective, callMcpTool, listMcpTools, toGeminiDeclaration } from "@/lib/providers/mcpTools";
 import { getRoleWorkspaceConfig } from "@/lib/roleWorkspaceRegistry";
 import { isUsableArticleImageUrl } from "@/lib/imageAssetContract";
 import {
@@ -432,16 +436,26 @@ function buildBaseGeminiContents(opts: {
   return list;
 }
 
+/** An enabled model that is not served by the Gemini API (router or CLI on this machine). */
+function localModel(modelId: string): MomoModelOption | undefined {
+  return MOMO_MODEL_CATALOG.find((m) => m.id === modelId && providerOf(m) !== "gemini");
+}
+
 function getOrderedCandidateModels(
   preferred: string,
-  hasExplicitModelId = false
+  hasExplicitModelId = false,
+  hasGeminiKey = true
 ): string[] {
   const cleanPreferred = preferred.replace(/^[a-z]+\//i, "").trim();
   const ordered = [
     ...(cleanPreferred ? [cleanPreferred] : []),
     MOMO_MODEL_CATALOG[0].id,
+    // the other local models are fallbacks too; Gemini API ones only count with a key
+    ...MOMO_MODEL_CATALOG.filter((m) => providerOf(m) !== "gemini").map((m) => m.id),
     ...DEFAULT_MODEL_CANDIDATES,
-  ].map((m) => m.replace(/^[a-z]+\//i, "").trim());
+  ]
+    .map((m) => m.replace(/^[a-z]+\//i, "").trim())
+    .filter((m) => hasGeminiKey || Boolean(localModel(m)));
 
   const unique: string[] = [];
   for (const m of ordered) {
@@ -451,7 +465,7 @@ function getOrderedCandidateModels(
   const pool = healthy.length > 0 ? healthy : unique;
   if (hasExplicitModelId && cleanPreferred) {
     // Always try the user's explicitly chosen model first even if it was recently throttled
-    return [cleanPreferred, ...pool.filter((m) => m !== cleanPreferred)];
+    return [...new Set([cleanPreferred, ...pool])].filter((m) => hasGeminiKey || Boolean(localModel(m)));
   }
   return pool;
 }
@@ -524,6 +538,11 @@ export async function POST(request: Request) {
     : undefined;
 
   const projectEnv = readProjectEnvLocal();
+  // Read-only tools of the machine's own MCP server (the owner's apps), offered next to web search.
+  const appTools = await listMcpTools();
+  const appToolNames = new Set(appTools.map((t) => t.name));
+  const functionDeclarations = [...GEMINI_FUNCTION_DECLARATIONS, ...appTools.map(toGeminiDeclaration)];
+  const appDirective = appToolsDirective(appTools);
   const apiKeys = resolveGeminiApiKeys(projectEnv);
   const apiKey = apiKeys[0] || "";
   const rawPreferred = (
@@ -577,7 +596,8 @@ export async function POST(request: Request) {
         reasoningEffort: resolvedEffort,
       });
 
-      if (!apiKey) {
+      const firstRouterModel = MOMO_MODEL_CATALOG.find((m) => providerOf(m) === "router");
+      if (!apiKey && !MOMO_MODEL_CATALOG.some((m) => providerOf(m) !== "gemini")) {
         send({
           type: "turn_error",
           message:
@@ -588,7 +608,12 @@ export async function POST(request: Request) {
       }
 
       const titlePromise = body.needsTitle
-        ? generateSessionTitle(latestUserText, getRotatedGeminiKeys(apiKeys), request.signal).then(
+        ? (apiKey
+            ? generateSessionTitle(latestUserText, getRotatedGeminiKeys(apiKeys), request.signal)
+            : firstRouterModel
+              ? titleFromRouter(latestUserText, firstRouterModel.upstreamId ?? firstRouterModel.id, request.signal)
+              : Promise.resolve(null)
+          ).then(
             (title) => {
               if (title) send({ type: "session_title", title });
             },
@@ -738,7 +763,7 @@ export async function POST(request: Request) {
       }));
 
       const hasExplicitModel = Boolean(body.modelId && body.modelId.trim());
-      const modelList = getOrderedCandidateModels(preferredModel, hasExplicitModel);
+      const modelList = getOrderedCandidateModels(preferredModel, hasExplicitModel, Boolean(apiKey));
       const turnSuffix = crypto.randomUUID().slice(0, 8);
       const turnStartMs = Date.now();
       let partCounter = 0;
@@ -845,13 +870,13 @@ export async function POST(request: Request) {
           ? effectiveNativeGoogle
             ? [
                 { google_search: {} },
-                { functionDeclarations: GEMINI_FUNCTION_DECLARATIONS },
+                { functionDeclarations },
               ]
-            : [{ functionDeclarations: GEMINI_FUNCTION_DECLARATIONS }]
+            : [{ functionDeclarations }]
           : undefined;
 
         const payload: Record<string, unknown> = {
-          systemInstruction: { parts: [{ text: activeStaticSystemPrompt }] },
+          systemInstruction: { parts: [{ text: `${activeStaticSystemPrompt}${appDirective}` }] },
           contents: cleanGeminiContents,
           generationConfig: {
             temperature: turnTemperature,
@@ -874,6 +899,26 @@ export async function POST(request: Request) {
               }
             : {}),
         };
+
+        const local = localModel(modelId);
+        if (local) {
+          // Same request, answered by the router or a CLI on this machine; the
+          // reply comes back as Gemini SSE, so everything below stays as it is.
+          const res = await streamFromLocalProvider(
+            local,
+            {
+              systemInstruction: { parts: [{ text: `${activeStaticSystemPrompt}${appDirective}` }] },
+              contents: contentsToSend,
+              generationConfig: { temperature: turnTemperature, maxOutputTokens: maxOut },
+              tools: toolsSpec,
+              ...(allowTools && forceFunctionCall
+                ? { toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["web_search", "search_images"] } } }
+                : {}),
+            },
+            request.signal,
+          );
+          return { res, usedModel: modelId, useReasoning: false };
+        }
 
         const res = await fetch(endpoint, {
           method: "POST",
@@ -1158,7 +1203,8 @@ export async function POST(request: Request) {
             }
 
             try {
-              const orderedKeys = getRotatedGeminiKeys(apiKeys);
+              // a local model needs no Gemini key: one attempt, with an empty placeholder
+              const orderedKeys = localModel(candidate) ? [""] : getRotatedGeminiKeys(apiKeys);
               let modelSucceeded = false;
               let hadNonAuthModelFailure = false;
 
@@ -1236,7 +1282,7 @@ export async function POST(request: Request) {
                   attempt.res.status === 500 ||
                   attempt.res.status === 503
                 ) {
-                  markGeminiKeyCooldown(candKey, attempt.res.status);
+                  if (candKey) markGeminiKeyCooldown(candKey, attempt.res.status);
                 }
                 if (
                   attempt.res.status === 429 ||
@@ -1390,7 +1436,9 @@ export async function POST(request: Request) {
 
             for (const part of parts) {
               if (part.functionCall && typeof part.functionCall.name === "string") {
-                part.functionCall.name = normalizeToolName(part.functionCall.name);
+                if (!appToolNames.has(part.functionCall.name)) {
+                  part.functionCall.name = normalizeToolName(part.functionCall.name);
+                }
               }
               pushModelPart(part);
 
@@ -1436,7 +1484,9 @@ export async function POST(request: Request) {
                       ? "Mencari foto kontekstual"
                       : fnName === "sync_workspace_board"
                         ? `Menyelaraskan ${cfg.boardLabel}`
-                        : "Memverifikasi konteks";
+                        : appToolNames.has(fnName)
+                          ? `Membaca data lokal: ${fnName}`
+                          : "Memverifikasi konteks";
 
                 const cleanNote = statusNote ? formatActivityQuery(statusNote, 110) : "";
                 const cleanQuery = query ? formatActivityQuery(query, 110) : "";
@@ -1906,6 +1956,24 @@ export async function POST(request: Request) {
                         columnsCount: cols.length,
                         itemsCount: items.length,
                       },
+                    },
+                  };
+                }
+
+                if (appToolNames.has(effectiveName)) {
+                  const out = await callMcpTool(effectiveName, tc.args, request.signal);
+                  send({
+                    type: "tool_result",
+                    toolCallId: tc.id,
+                    name: effectiveName,
+                    summary: out.isError ? "Data lokal tidak terbaca" : "Data lokal terbaca",
+                    elapsedMs: Math.max(80, Date.now() - tc.startedAt),
+                  });
+                  return {
+                    functionResponse: {
+                      id: tc.id,
+                      name: effectiveName,
+                      response: out.isError ? { error: out.text } : { result: out.text },
                     },
                   };
                 }
