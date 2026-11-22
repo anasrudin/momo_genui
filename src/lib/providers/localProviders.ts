@@ -12,12 +12,14 @@ import { providerOf, type MomoModelOption } from "@/lib/modelCatalog";
 import {
   ChatSseToGemini,
   CliJsonToGemini,
+  cliMcpToolName,
   forcedToolCallChunk,
   toChatCompletionsRequest,
   toCliPrompt,
   type CliFlavor,
   type GeminiRequest,
 } from "./geminiBridge";
+import { listMcpTools, listUnofferedMcpToolNames, mcpServerCommand } from "./mcpTools";
 
 const SSE_HEADERS = { "Content-Type": "text/event-stream; charset=utf-8" };
 const encoder = new TextEncoder();
@@ -85,20 +87,62 @@ function cliEnv(): NodeJS.ProcessEnv {
   return { ...process.env, PATH: [...extra, process.env.PATH || "/usr/bin:/bin"].join(":") };
 }
 
-function cliCommand(flavor: CliFlavor, model: string, workDir: string, req: GeminiRequest): { bin: string; args: string[]; stdin: string } {
-  const { system, prompt, images } = toCliPrompt(req);
+/** What the Claude CLI may reach of the local MCP server: the tools Momo itself would offer, and no others. */
+interface CliMcp {
+  server: { command: string; args: string[] };
+  /** Bare names from `listMcpTools()`: the only tools the run may call. */
+  tools: string[];
+  /** Every other tool of the server, switched off by name so the model does not even see it. */
+  hidden: string[];
+}
+
+async function cliMcp(): Promise<CliMcp | null> {
+  const server = mcpServerCommand();
+  if (!server) return null;
+  const tools = (await listMcpTools()).map((t) => t.name);
+  if (!tools.length) return null;
+  return { server, tools, hidden: await listUnofferedMcpToolNames() };
+}
+
+function cliCommand(flavor: CliFlavor, model: string, workDir: string, req: GeminiRequest, mcp: CliMcp | null): { bin: string; args: string[]; stdin: string } {
+  const { system, prompt, images } = toCliPrompt(req, flavor === "claude" && mcp ? mcp.tools : []);
   if (flavor === "claude") {
     const systemFile = path.join(workDir, "system.txt");
     fs.writeFileSync(systemFile, system || "You are Momo.");
+    let mcpArgs = ["--strict-mcp-config"];
+    if (mcp) {
+      const mcpFile = path.join(workDir, "mcp.json");
+      fs.writeFileSync(mcpFile, JSON.stringify({
+        mcpServers: {
+          momo: {
+            type: "stdio",
+            command: mcp.server.command,
+            args: mcp.server.args,
+            // read-only always; the server's private data only when Momo's own environment turns it on
+            env: {
+              UBUNTU_MCP_READONLY: "1",
+              ...(process.env.UBUNTU_MCP_PRIVATE ? { UBUNTU_MCP_PRIVATE: process.env.UBUNTU_MCP_PRIVATE } : {}),
+            },
+          },
+        },
+      }));
+      mcpArgs = [
+        "--mcp-config", mcpFile, "--strict-mcp-config",
+        // pre-approved: exactly the tools Momo offers. Anything else would need a prompt nobody can answer, so it is denied.
+        "--allowedTools", mcp.tools.map(cliMcpToolName).join(","),
+        ...(mcp.hidden.length ? ["--disallowedTools", mcp.hidden.map(cliMcpToolName).join(",")] : []),
+        "--permission-prompts", "none",
+      ];
+    }
     return {
       bin: process.env.MOMO_CLAUDE_CLI || "claude",
-      // A text generator and nothing else: no built-in tools, no MCP servers, no
-      // user settings, hooks or skills, and no session written to disk.
+      // A text generator that can at most read through Momo's own MCP tools: no built-in tools,
+      // no other MCP servers, no user settings, hooks or skills, and no session written to disk.
       args: [
         "-p", "--model", model || "sonnet",
         "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--include-partial-messages",
         "--system-prompt-file", systemFile,
-        "--tools", "", "--strict-mcp-config", "--setting-sources", "",
+        "--tools", "", ...mcpArgs, "--setting-sources", "",
         "--no-session-persistence", "--disable-slash-commands",
       ],
       stdin: `${JSON.stringify({
@@ -120,14 +164,15 @@ function cliCommand(flavor: CliFlavor, model: string, workDir: string, req: Gemi
   };
 }
 
-function streamFromCli(flavor: CliFlavor, req: GeminiRequest, upstreamModel: string, signal: AbortSignal): Promise<Response> {
+async function streamFromCli(flavor: CliFlavor, req: GeminiRequest, upstreamModel: string, signal: AbortSignal): Promise<Response> {
   const forced = forcedToolCallChunk(req);
-  if (forced) return Promise.resolve(new Response(forced, { status: 200, headers: SSE_HEADERS }));
-  if (cliRuns >= MAX_CLI_RUNS) return Promise.resolve(fail(429, "too many CLI runs at once"));
+  if (forced) return new Response(forced, { status: 200, headers: SSE_HEADERS });
+  const mcp = flavor === "claude" ? await cliMcp() : null;
+  if (cliRuns >= MAX_CLI_RUNS) return fail(429, "too many CLI runs at once");
 
   // An empty directory of its own: the CLI has no project to read, and nothing of ours to touch.
   const workDir = fs.mkdtempSync(path.join(os.tmpdir(), "momo-cli-"));
-  const { bin, args, stdin } = cliCommand(flavor, upstreamModel, workDir, req);
+  const { bin, args, stdin } = cliCommand(flavor, upstreamModel, workDir, req, mcp);
   const bridge = new CliJsonToGemini(flavor);
   const decoder = new TextDecoder();
   cliRuns++;

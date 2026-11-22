@@ -50,13 +50,19 @@ export function toGeminiDeclaration(tool: McpTool): GeminiFunctionDeclaration {
 
 const TIMEOUT_MS = 45_000;
 const CACHE_MS = 60_000;
-let cache: { at: number; command: string; allow: string; tools: McpTool[] } | null = null;
+let cache: { at: number; command: string; allow: string; tools: McpTool[]; unoffered: string[] } | null = null;
 
 export function resetMcpCache(): void {
   cache = null;
 }
 
 const commandLine = () => (process.env.MOMO_MCP_COMMAND || "").trim();
+
+/** The configured server as binary + arguments, for a client that starts it itself (the Claude CLI). Null when unset. */
+export function mcpServerCommand(): { command: string; args: string[] } | null {
+  const [command, ...args] = commandLine().split(/\s+/);
+  return command ? { command, args } : null;
+}
 
 /** One request to the server: start it, initialize, ask, read the answer, let it exit. */
 function mcpRequest(method: string, params: Record<string, unknown>, signal?: AbortSignal): Promise<Record<string, unknown>> {
@@ -111,16 +117,28 @@ export async function listMcpTools(): Promise<McpTool[]> {
   const allow = (process.env.MOMO_MCP_TOOLS || "").trim();
   if (cache && cache.command === command && cache.allow === allow && Date.now() - cache.at < CACHE_MS) return cache.tools;
   let tools: McpTool[] = [];
+  let unoffered: string[] = [];
   try {
     const result = await mcpRequest("tools/list", {});
     const all = Array.isArray(result.tools) ? (result.tools as McpTool[]) : [];
     const wanted = allow ? new Set(allow.split(/[\s,;]+/).filter(Boolean)) : null;
     tools = all.filter((t) => t && typeof t.name === "string" && t.annotations?.readOnlyHint === true && (!wanted || wanted.has(t.name)));
+    const offered = new Set(tools.map((t) => t.name));
+    unoffered = all.filter((t) => t && typeof t.name === "string" && !offered.has(t.name)).map((t) => t.name);
   } catch {
     // no server, no tools: the chat goes on without them
   }
-  cache = { at: Date.now(), command, allow, tools };
+  cache = { at: Date.now(), command, allow, tools, unoffered };
   return tools;
+}
+
+/**
+ * Names the server has but `listMcpTools()` does not offer (not read-only, or outside MOMO_MCP_TOOLS).
+ * A client that talks to the server directly needs them to switch those tools off by name.
+ */
+export async function listUnofferedMcpToolNames(): Promise<string[]> {
+  await listMcpTools();
+  return commandLine() && cache ? cache.unoffered : [];
 }
 
 const MAX_TEXT = 14_000;

@@ -729,6 +729,12 @@ export const ProfileMenuPopover: React.FC<ProfileMenuPopoverProps> = ({
   } | null>(null);
   useDismissOnOutside(open, popRef, anchorRef, onClose);
 
+  // The optional password login (MOMO_PASSWORD) leaves a marker cookie; only then is there something to sign out of.
+  const [canSignOut, setCanSignOut] = useState(false);
+  useEffect(() => {
+    if (open) setCanSignOut(/(?:^|;\s*)momo_auth=1(?:;|$)/.test(document.cookie));
+  }, [open]);
+
   const menuPositionRef = useCallback(
     (el: HTMLDivElement | null) => {
       popRef.current = el;
@@ -1016,6 +1022,22 @@ export const ProfileMenuPopover: React.FC<ProfileMenuPopoverProps> = ({
             >
               <span>{hasActiveMessages ? "Reset Sesi Aktif" : "+ Obrolan Baru"}</span>
             </button>
+            {canSignOut && (
+              <button
+                id="profileSignOutBtn"
+                type="button"
+                role="menuitem"
+                className="bot-menu-new"
+                style={{ marginTop: 6 }}
+                onClick={() => {
+                  void fetch("/api/logout", { method: "POST", headers: { Accept: "application/json" } })
+                    .catch(() => undefined)
+                    .then(() => window.location.assign("/login"));
+                }}
+              >
+                <span>Keluar</span>
+              </button>
+            )}
           </div>
         </motion.div>
       )}

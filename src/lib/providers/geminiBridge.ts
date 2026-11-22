@@ -243,10 +243,27 @@ export interface CliPrompt {
 const CLI_NOTE =
   "Catatan runtime: di sesi ini tidak ada tool yang bisa dipanggil. Jangan menulis pemanggilan tool; jawab dari percakapan dan dari blok <tool_result> bila ada.";
 
+/** The name the Claude CLI gives a tool of the MCP server Momo declares to it as `momo`. */
+export const cliMcpToolName = (tool: string) => `mcp__momo__${tool}`;
+
+/** The runtime note for a CLI run that can call the local MCP tools itself. */
+function cliMcpNote(tools: string[]): string {
+  return [
+    `Catatan runtime: di sesi ini kamu bisa memanggil sendiri tool berikut: ${tools.map((t) => `\`${cliMcpToolName(t)}\``).join(", ")}.`,
+    "Tool itu membaca data ASLI milik pengguna di server ini (tool lokal bernama `x` di instruksi lain = `mcp__momo__x` di sini).",
+    "Untuk pertanyaan tentang server atau aplikasi milik pengguna, WAJIB panggil tool yang cocok lebih dulu dan jawab dari hasilnya; jangan menebak atau mengarang angka.",
+    "Tidak ada tool lain di sesi ini (termasuk web_search): jangan menulis pemanggilan tool lain; untuk hal lain jawab dari percakapan dan dari blok <tool_result> bila ada.",
+  ].join(" ");
+}
+
 const clip = (s: string, max: number) => (s.length > max ? `${s.slice(0, max)}… [dipotong ${s.length - max} karakter]` : s);
 
-/** A CLI takes one prompt, so the conversation is written out as a transcript. */
-export function toCliPrompt(req: GeminiRequest): CliPrompt {
+/**
+ * A CLI takes one prompt, so the conversation is written out as a transcript.
+ * `mcpTools` are the local MCP tools this run can call by itself (bare names); none by default.
+ */
+export function toCliPrompt(req: GeminiRequest, mcpTools: string[] = []): CliPrompt {
+  const note = mcpTools.length ? cliMcpNote(mcpTools) : CLI_NOTE;
   const blocks: string[] = [];
   for (const turn of req.contents) {
     const lines: string[] = [];
@@ -264,8 +281,8 @@ export function toCliPrompt(req: GeminiRequest): CliPrompt {
   return {
     system: systemText(req),
     prompt: single
-      ? `${blocks[0].replace(/^### User\n/, "")}\n\n${CLI_NOTE}`
-      : `Percakapan sejauh ini:\n\n${blocks.join("\n\n")}\n\n${CLI_NOTE}\nLanjutkan sebagai Assistant: jawab giliran User yang terakhir.`,
+      ? `${blocks[0].replace(/^### User\n/, "")}\n\n${note}`
+      : `Percakapan sejauh ini:\n\n${blocks.join("\n\n")}\n\n${note}\nLanjutkan sebagai Assistant: jawab giliran User yang terakhir.`,
     images,
   };
 }
@@ -296,6 +313,9 @@ export class CliJsonToGemini {
   private lines = new LineBuffer();
   private done = false;
   private sawDelta = false;
+  /** Claude: visible text was sent, so the next assistant turn's text starts a new paragraph. */
+  private saidText = false;
+  private turnBreak = false;
 
   constructor(private flavor: CliFlavor) {}
 
@@ -330,14 +350,32 @@ export class CliJsonToGemini {
     return this.flavor === "claude" ? this.onClaude(j) : this.onGemini(j);
   }
 
-  /** `claude -p --output-format stream-json --include-partial-messages` */
+  /** Text of one Claude turn; a run that used tools has several turns, kept apart by a blank line. */
+  private claudeText(text: string): string[] {
+    const out = partsChunk([{ text: this.turnBreak ? `\n\n${text}` : text }]);
+    this.turnBreak = false;
+    this.saidText = true;
+    return [out];
+  }
+
+  /**
+   * `claude -p --output-format stream-json --include-partial-messages`
+   *
+   * With MCP tools the run is several assistant turns: a turn may end in `tool_use`, the CLI runs
+   * the tool and feeds the `tool_result` back as a `user` line, and the next turn goes on. Only
+   * text and thinking are passed on; the stream ends at the one final `result` line.
+   */
   private onClaude(j: Record<string, unknown>): string[] {
     if (j.type === "stream_event") {
       const ev = j.event as { type?: string; delta?: { type?: string; text?: string; thinking?: string } } | undefined;
+      if (ev?.type === "message_start") {
+        this.turnBreak = this.saidText;
+        return [];
+      }
       if (ev?.type !== "content_block_delta" || !ev.delta) return [];
       if (ev.delta.type === "text_delta" && ev.delta.text) {
         this.sawDelta = true;
-        return [partsChunk([{ text: ev.delta.text }])];
+        return this.claudeText(ev.delta.text);
       }
       if (ev.delta.type === "thinking_delta" && ev.delta.thinking) return [partsChunk([{ text: ev.delta.thinking, thought: true }])];
       return [];
@@ -346,7 +384,9 @@ export class CliJsonToGemini {
       // no partial messages came through: fall back to the whole message
       const content = (j.message as { content?: Array<{ type?: string; text?: string }> } | undefined)?.content ?? [];
       const text = content.filter((c) => c.type === "text" && c.text).map((c) => c.text).join("");
-      return text ? [partsChunk([{ text }])] : [];
+      if (!text) return [];
+      this.turnBreak = this.saidText;
+      return this.claudeText(text);
     }
     if (j.type === "result") {
       if (j.is_error) {
@@ -357,12 +397,17 @@ export class CliJsonToGemini {
       const cached = u.cache_read_input_tokens ?? 0;
       const prompt = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + cached;
       const outTokens = u.output_tokens ?? 0;
-      return this.finish("STOP", {
-        promptTokenCount: prompt,
-        candidatesTokenCount: outTokens,
-        ...(cached ? { cachedContentTokenCount: cached } : {}),
-        totalTokenCount: prompt + outTokens,
-      });
+      // a run whose text never came through as a message still carries its answer here
+      const late = !this.done && !this.saidText && typeof j.result === "string" && j.result ? this.claudeText(j.result) : [];
+      return [
+        ...late,
+        ...this.finish("STOP", {
+          promptTokenCount: prompt,
+          candidatesTokenCount: outTokens,
+          ...(cached ? { cachedContentTokenCount: cached } : {}),
+          totalTokenCount: prompt + outTokens,
+        }),
+      ];
     }
     return [];
   }
