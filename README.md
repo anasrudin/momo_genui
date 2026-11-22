@@ -154,6 +154,10 @@ How it works: `src/lib/providers/geminiBridge.ts` turns the route's Gemini reque
 
 The CLIs run as plain text generators: an empty working directory, no built-in tools, no MCP servers, no user settings or hooks, no saved session. Web grounding still needs `TINYFISH_API_KEY`, `EXA_API_KEY` or `FIRECRAWL_API_KEY`; without them searches come back empty and the model says so.
 
+### Tools from a local MCP server
+
+Set `MOMO_MCP_COMMAND` to a stdio MCP server (for example `/usr/local/bin/ubuntu-mcp`) and its read-only tools are offered to the model next to web search (`src/lib/providers/mcpTools.ts`). Only tools the server marks `readOnlyHint: true` are listed or run; `MOMO_MCP_TOOLS` narrows the list. The system prompt then tells the model to read the owner's data through these tools and never to invent it. Router and Gemini API models can call them; the CLI models cannot.
+
 There is no login. Anyone who can reach the server spends the owner's model accounts, so keep it on loopback or a trusted LAN.
 
 ## Verification
