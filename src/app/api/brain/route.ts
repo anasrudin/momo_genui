@@ -40,6 +40,7 @@ import {
   type ReasoningEffort,
 } from "@/lib/modelCatalog";
 import { streamFromLocalProvider, titleFromRouter } from "@/lib/providers/localProviders";
+import { appToolsDirective, callMcpTool, listMcpTools, toGeminiDeclaration } from "@/lib/providers/mcpTools";
 import { getRoleWorkspaceConfig } from "@/lib/roleWorkspaceRegistry";
 import { isUsableArticleImageUrl } from "@/lib/imageAssetContract";
 import {
@@ -537,6 +538,11 @@ export async function POST(request: Request) {
     : undefined;
 
   const projectEnv = readProjectEnvLocal();
+  // Read-only tools of the machine's own MCP server (the owner's apps), offered next to web search.
+  const appTools = await listMcpTools();
+  const appToolNames = new Set(appTools.map((t) => t.name));
+  const functionDeclarations = [...GEMINI_FUNCTION_DECLARATIONS, ...appTools.map(toGeminiDeclaration)];
+  const appDirective = appToolsDirective(appTools);
   const apiKeys = resolveGeminiApiKeys(projectEnv);
   const apiKey = apiKeys[0] || "";
   const rawPreferred = (
@@ -864,13 +870,13 @@ export async function POST(request: Request) {
           ? effectiveNativeGoogle
             ? [
                 { google_search: {} },
-                { functionDeclarations: GEMINI_FUNCTION_DECLARATIONS },
+                { functionDeclarations },
               ]
-            : [{ functionDeclarations: GEMINI_FUNCTION_DECLARATIONS }]
+            : [{ functionDeclarations }]
           : undefined;
 
         const payload: Record<string, unknown> = {
-          systemInstruction: { parts: [{ text: activeStaticSystemPrompt }] },
+          systemInstruction: { parts: [{ text: `${activeStaticSystemPrompt}${appDirective}` }] },
           contents: cleanGeminiContents,
           generationConfig: {
             temperature: turnTemperature,
@@ -901,7 +907,7 @@ export async function POST(request: Request) {
           const res = await streamFromLocalProvider(
             local,
             {
-              systemInstruction: { parts: [{ text: activeStaticSystemPrompt }] },
+              systemInstruction: { parts: [{ text: `${activeStaticSystemPrompt}${appDirective}` }] },
               contents: contentsToSend,
               generationConfig: { temperature: turnTemperature, maxOutputTokens: maxOut },
               tools: toolsSpec,
@@ -1430,7 +1436,9 @@ export async function POST(request: Request) {
 
             for (const part of parts) {
               if (part.functionCall && typeof part.functionCall.name === "string") {
-                part.functionCall.name = normalizeToolName(part.functionCall.name);
+                if (!appToolNames.has(part.functionCall.name)) {
+                  part.functionCall.name = normalizeToolName(part.functionCall.name);
+                }
               }
               pushModelPart(part);
 
@@ -1476,7 +1484,9 @@ export async function POST(request: Request) {
                       ? "Mencari foto kontekstual"
                       : fnName === "sync_workspace_board"
                         ? `Menyelaraskan ${cfg.boardLabel}`
-                        : "Memverifikasi konteks";
+                        : appToolNames.has(fnName)
+                          ? `Membaca data lokal: ${fnName}`
+                          : "Memverifikasi konteks";
 
                 const cleanNote = statusNote ? formatActivityQuery(statusNote, 110) : "";
                 const cleanQuery = query ? formatActivityQuery(query, 110) : "";
@@ -1946,6 +1956,24 @@ export async function POST(request: Request) {
                         columnsCount: cols.length,
                         itemsCount: items.length,
                       },
+                    },
+                  };
+                }
+
+                if (appToolNames.has(effectiveName)) {
+                  const out = await callMcpTool(effectiveName, tc.args, request.signal);
+                  send({
+                    type: "tool_result",
+                    toolCallId: tc.id,
+                    name: effectiveName,
+                    summary: out.isError ? "Data lokal tidak terbaca" : "Data lokal terbaca",
+                    elapsedMs: Math.max(80, Date.now() - tc.startedAt),
+                  });
+                  return {
+                    functionResponse: {
+                      id: tc.id,
+                      name: effectiveName,
+                      response: out.isError ? { error: out.text } : { result: out.text },
                     },
                   };
                 }
