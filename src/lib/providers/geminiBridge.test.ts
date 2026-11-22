@@ -170,6 +170,21 @@ test("cli prompt: history, tool results and the last user turn are flattened; im
   assert.deepEqual(withImage.images, [{ mimeType: "image/png", data: "AAAA" }]);
 });
 
+test("cli prompt: with MCP tools the note names them and drops the no-tools line; without, it is unchanged", () => {
+  const plain = toCliPrompt(REQUEST);
+  assert.match(plain.prompt, /tidak ada tool yang bisa dipanggil/);
+  assert.deepEqual(toCliPrompt(REQUEST, []), plain);
+  const p = toCliPrompt(REQUEST, ["whats_up", "ritel_market_today"]);
+  assert.ok(!p.prompt.includes("tidak ada tool yang bisa dipanggil"));
+  assert.match(p.prompt, /`mcp__momo__whats_up`, `mcp__momo__ritel_market_today`/);
+  assert.match(p.prompt, /data ASLI milik pengguna/);
+  assert.match(p.prompt, /WAJIB panggil tool/);
+  assert.match(p.prompt, /Tidak ada tool lain/);
+  assert.match(p.prompt, /Lanjutkan sebagai Assistant/);
+  const single = toCliPrompt({ ...REQUEST, contents: [{ role: "user", parts: [{ text: "IHSG?" }] }] }, ["whats_up"]);
+  assert.match(single.prompt, /^IHSG\?\n\nCatatan runtime: .*`mcp__momo__whats_up`/);
+});
+
 test("cli: a forced tool step is answered with a web_search call built from the user's own words", () => {
   const forced: GeminiRequest = {
     ...REQUEST,
@@ -198,6 +213,86 @@ test("claude cli stream: text deltas, thinking deltas, then usage and STOP from 
   assert.equal(out[2].candidates[0].finishReason, "STOP");
   assert.deepEqual(out[2].usageMetadata, { promptTokenCount: 652, candidatesTokenCount: 15, cachedContentTokenCount: 50, totalTokenCount: 667 });
   assert.equal(c.error, null);
+});
+
+// Lines recorded from `claude -p --model haiku --output-format stream-json --verbose --include-partial-messages`
+// (2.1.330) answering "Pakai tool whats_up lalu ringkas dalam 2 kalimat." with the `momo` MCP server; ids,
+// usage details, signatures and most of the tool output are trimmed, the event shapes are as printed.
+const SID = { session_id: "51e27c93", parent_tool_use_id: null };
+const se = (event: unknown, extra: Record<string, unknown> = {}) => JSON.stringify({ type: "stream_event", event, ...SID, ...extra });
+const TOOL_USE = { type: "tool_use", id: "toolu_01Fsf9t2", name: "mcp__momo__whats_up", input: {}, caller: { type: "direct" } };
+const TOOL_RUN: string[] = [
+  JSON.stringify({ type: "system", subtype: "init", tools: ["mcp__momo__ritel_market_today", "mcp__momo__whats_up"], mcp_servers: [{ name: "momo", status: "connected", source: "dynamic" }], model: "claude-haiku-5-5", permissionMode: "default" }),
+  JSON.stringify({ type: "system", subtype: "status", status: "requesting" }),
+  se({ type: "message_start", message: { model: "claude-haiku-5-5", id: "msg_011ChHwNLe", type: "message", role: "assistant", content: [], stop_reason: null, usage: { input_tokens: 2, cache_creation_input_tokens: 3083, cache_read_input_tokens: 0, output_tokens: 24 } } }, { ttft_ms: 646 }),
+  se({ type: "content_block_start", index: 0, content_block: TOOL_USE }),
+  se({ type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: "" } }),
+  JSON.stringify({ type: "assistant", message: { model: "claude-haiku-5-5", id: "msg_011ChHwNLe", type: "message", role: "assistant", content: [TOOL_USE], stop_reason: null, usage: { input_tokens: 2, output_tokens: 24 } }, ...SID }),
+  se({ type: "content_block_stop", index: 0 }),
+  se({ type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { input_tokens: 2, cache_creation_input_tokens: 3083, output_tokens: 34 } }),
+  se({ type: "message_stop" }),
+  JSON.stringify({ type: "rate_limit_event", rate_limit_info: { status: "allowed", rateLimitType: "five_hour" } }),
+  JSON.stringify({ type: "user", message: { role: "user", content: [{ tool_use_id: "toolu_01Fsf9t2", type: "tool_result", content: [{ type: "text", text: '{\n  "as_of": "2026-11-22",\n  "server": { "alerts": [], "services_down": [] },\n  "market": { "as_of": "2026-11-20", "age_days": 2 }\n}' }] }] }, ...SID }),
+  JSON.stringify({ type: "system", subtype: "status", status: "requesting" }),
+  se({ type: "message_start", message: { model: "claude-haiku-5-5", id: "msg_011ChHwNQu", type: "message", role: "assistant", content: [], stop_reason: null, usage: { input_tokens: 2, output_tokens: 1 } } }),
+  se({ type: "content_block_start", index: 0, content_block: { type: "thinking", thinking: "", signature: "" } }),
+  JSON.stringify({ type: "system", subtype: "thinking_tokens", estimated_tokens: 50, estimated_tokens_delta: 50 }),
+  se({ type: "content_block_delta", index: 0, delta: { type: "thinking_delta", thinking: "", estimated_tokens: 50 } }),
+  se({ type: "content_block_delta", index: 0, delta: { type: "signature_delta", signature: "CAQS5AcKEAgUGAI4" } }),
+  JSON.stringify({ type: "assistant", message: { id: "msg_011ChHwNQu", type: "message", role: "assistant", content: [{ type: "thinking", thinking: "", signature: "CAQS5AcKEAgUGAI4" }] }, ...SID }),
+  se({ type: "content_block_stop", index: 0 }),
+  se({ type: "content_block_start", index: 1, content_block: { type: "text", text: "" } }),
+  se({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: "Server" } }),
+  se({ type: "content_block_delta", index: 1, delta: { type: "text_delta", text: " aman: tidak ada alert." } }),
+  JSON.stringify({ type: "assistant", message: { id: "msg_011ChHwNQu", type: "message", role: "assistant", content: [{ type: "text", text: "Server aman: tidak ada alert." }] }, ...SID }),
+  se({ type: "content_block_stop", index: 1 }),
+  se({ type: "message_delta", delta: { stop_reason: "end_turn", stop_sequence: null }, usage: { input_tokens: 2, output_tokens: 359 } }),
+  se({ type: "message_stop" }),
+  JSON.stringify({ type: "result", subtype: "success", is_error: false, num_turns: 2, stop_reason: "end_turn", terminal_reason: "completed", permission_denials: [], result: "Server aman: tidak ada alert.", usage: { input_tokens: 4, cache_creation_input_tokens: 4102, cache_read_input_tokens: 3083, output_tokens: 393, output_tokens_details: { thinking_tokens: 205 } } }),
+];
+
+test("claude cli stream: a run that calls an MCP tool streams only the answer text and ends once, on the result", () => {
+  const c = new CliJsonToGemini("claude");
+  // fed in uneven pieces, as a pipe delivers it
+  const raw = TOOL_RUN.join("\n") + "\n";
+  const out = parse([...c.push(raw.slice(0, 700)), ...c.push(raw.slice(700, 4000)), ...c.push(raw.slice(4000)), ...c.end()]);
+  assert.deepEqual(out.slice(0, -1).map((x) => x.candidates[0].content.parts), [[{ text: "Server" }], [{ text: " aman: tidak ada alert." }]]);
+  const last = out[out.length - 1];
+  assert.equal(last.candidates[0].finishReason, "STOP");
+  assert.equal(last.candidates[0].content, undefined, "the tool call must not surface as a functionCall for the route to run");
+  assert.deepEqual(last.usageMetadata, { promptTokenCount: 7189, candidatesTokenCount: 393, cachedContentTokenCount: 3083, totalTokenCount: 7582 });
+  assert.equal(out.filter((x) => x.candidates[0].finishReason).length, 1);
+  assert.equal(c.error, null);
+});
+
+test("claude cli stream: text before a tool call and text after it are both kept, a blank line apart", () => {
+  const c = new CliJsonToGemini("claude");
+  const before = [
+    TOOL_RUN[2],
+    se({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
+    se({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "Saya cek dulu." } }),
+    se({ type: "content_block_stop", index: 0 }),
+  ];
+  const out = parse([...c.push([...before, ...TOOL_RUN.slice(3)].join("\n") + "\n"), ...c.end()]);
+  const text = out.flatMap((x) => x.candidates[0].content?.parts ?? []).map((p: { text: string }) => p.text).join("");
+  assert.equal(text, "Saya cek dulu.\n\nServer aman: tidak ada alert.");
+});
+
+test("claude cli stream: without partial messages the whole assistant messages are used, tool turns included", () => {
+  const c = new CliJsonToGemini("claude");
+  const whole = TOOL_RUN.filter((l) => JSON.parse(l).type !== "stream_event");
+  const out = parse([...c.push(whole.join("\n") + "\n"), ...c.end()]);
+  assert.deepEqual(out.map((x) => x.candidates[0].content?.parts), [[{ text: "Server aman: tidak ada alert." }], undefined]);
+  assert.equal(out[1].candidates[0].finishReason, "STOP");
+});
+
+test("claude cli stream: an error result after a tool turn is still an error", () => {
+  const c = new CliJsonToGemini("claude");
+  const failed = JSON.stringify({ type: "result", subtype: "error_max_turns", is_error: true, num_turns: 2, result: "" });
+  const out = parse([...c.push([...TOOL_RUN.slice(0, 11), failed].join("\n") + "\n"), ...c.end()]);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].candidates[0].finishReason, "OTHER");
+  assert.match(c.error ?? "", /error_max_turns/);
 });
 
 test("claude cli stream: an error result is reported, not turned into an answer", () => {

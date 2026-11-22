@@ -147,18 +147,37 @@ Momo can answer from what is already signed in on the machine it runs on. Set `N
 | Model id | Backend | Tools (web/image search, Pinboard) | Images in |
 |---|---|---|---|
 | `router-*` | OpenAI-compatible router such as 9router (`MOMO_ROUTER_URL`) | yes | yes |
-| `claude-cli-*` | `claude -p`, headless, on the machine user's Claude login | no; a required search step is run by Momo itself | yes |
-| `gemini-cli` | `gemini -p`, headless, on the machine user's Gemini login | same as above | no |
+| `claude-cli-*` | `claude -p`, headless, on the machine user's Claude login | Momo's own tools: no; a required search step is run by Momo itself. Local MCP tools: yes, called by the CLI itself (see below) | yes |
+| `gemini-cli` | `gemini -p`, headless, on the machine user's Gemini login | no; a required search step is run by Momo itself | no |
 
 How it works: `src/lib/providers/geminiBridge.ts` turns the route's Gemini request into a chat-completions request or a CLI prompt, and turns the reply back into Gemini SSE, so `/api/brain` keeps its parser, tool loop and retries. `src/lib/providers/localProviders.ts` does the fetching and spawning.
 
-The CLIs run as plain text generators: an empty working directory, no built-in tools, no MCP servers, no user settings or hooks, no saved session. Web grounding still needs `TINYFISH_API_KEY`, `EXA_API_KEY` or `FIRECRAWL_API_KEY`; without them searches come back empty and the model says so.
+The CLIs run as plain text generators: an empty working directory, no built-in tools, no user settings or hooks, no saved session, and no MCP servers other than the one described below. Web grounding still needs `TINYFISH_API_KEY`, `EXA_API_KEY` or `FIRECRAWL_API_KEY`; without them searches come back empty and the model says so.
 
 ### Tools from a local MCP server
 
-Set `MOMO_MCP_COMMAND` to a stdio MCP server (for example `/usr/local/bin/ubuntu-mcp`) and its read-only tools are offered to the model next to web search (`src/lib/providers/mcpTools.ts`). Only tools the server marks `readOnlyHint: true` are listed or run; `MOMO_MCP_TOOLS` narrows the list. The system prompt then tells the model to read the owner's data through these tools and never to invent it. Router and Gemini API models can call them; the CLI models cannot.
+Set `MOMO_MCP_COMMAND` to a stdio MCP server (for example `/usr/local/bin/ubuntu-mcp`) and its read-only tools are offered to the model next to web search (`src/lib/providers/mcpTools.ts`). Only tools the server marks `readOnlyHint: true` are listed or run; `MOMO_MCP_TOOLS` narrows the list. The system prompt then tells the model to read the owner's data through these tools and never to invent it. Router and Gemini API models call them through Momo's tool loop. The Claude CLI calls them itself: when `listMcpTools()` offers tools, each run gets a generated `mcp.json` in its temporary directory declaring that one server as `momo`, and these extra flags:
 
-There is no login. Anyone who can reach the server spends the owner's model accounts, so keep it on loopback or a trusted LAN.
+```
+--mcp-config <workdir>/mcp.json --strict-mcp-config
+--allowedTools mcp__momo__<tool>,…        # exactly the tools Momo offers, nothing else
+--disallowedTools mcp__momo__<other>,…    # every other tool of the server, hidden from the model
+--permission-prompts none                 # anything not pre-approved is denied, never asked
+```
+
+Built-in tools stay off (`--tools ""`), and the server is started with `UBUNTU_MCP_READONLY=1` always and `UBUNTU_MCP_PRIVATE` only when Momo's own environment sets it. With no `MOMO_MCP_COMMAND`, or when the server offers nothing, the arguments are the plain text-generator ones. The Gemini CLI gets no tools.
+
+## Password login (optional)
+
+Without a login, anyone who can reach the server spends the owner's model accounts and can read whatever the MCP tools read. Set `MOMO_PASSWORD` to put one shared password in front of everything:
+
+- Unset or empty: no login, nothing changes (this is how the Vercel deployment runs).
+- Set: every page and every `/api/*` route needs a session cookie. Pages redirect to `/login?next=<path>`; API calls get `401` JSON. Open without a session: `/api/health`, `/login`, `/api/login`, `/api/logout`, `/_next/*`, `/favicon.svg`, `/fonts/*`.
+- `POST /api/login` with `{ "password": "…" }` (JSON, or the form on `/login`) sets `momo_session`: HttpOnly, SameSite=Lax, 30 days, `Secure` only when `x-forwarded-proto` is `https`. Its value is an expiry plus an HMAC-SHA256 signature. Five wrong passwords per minute per client address (first hop of `x-forwarded-for`), then `429`.
+- `POST /api/logout` clears it. The profile menu shows **Keluar** while signed in.
+- The signing key is `MOMO_SESSION_SECRET`, or is derived from the password, so changing the password signs everyone out. Sessions are stateless: there is no per-session revocation other than changing the password or the secret.
+
+The gate is `src/proxy.ts` (Next.js 16's `middleware` successor, Node.js runtime); signing, verification, the open-path list and the rate limiter live in `src/lib/auth/session.ts`. Both variables are read at run time: restart the server after changing them, no rebuild needed.
 
 ## Verification
 
