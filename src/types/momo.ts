@@ -1,3 +1,5 @@
+import type { WriteProposalCard, WriteProposalRow } from "@/lib/famhub/proposalCard";
+
 export type RolePaletteTuple = readonly [string, string, string, string];
 
 export type LookId =
@@ -310,6 +312,8 @@ export interface ChatMessage {
   previousLook?: string;
   botLabel?: string;
   sources?: SourceItem[];
+  /** FamHub writes proposed in this turn, with what became of each (see `lib/famhub/proposalCard.ts`). */
+  writeProposals?: WriteProposalCard[];
   /** Image URLs the backend verified for this turn. Defined (possibly empty) on every turn recorded since the pool was introduced. */
   imagePool?: string[];
   showActions?: boolean;
@@ -433,6 +437,15 @@ export type BrainSseEvent =
   | {
       type: "session_title";
       title: string;
+    }
+  | {
+      /** A FamHub write the model proposed. Nothing is recorded until the user confirms it by id. */
+      type: "write_proposal";
+      id: string;
+      kind: "transaction" | "bill";
+      title: string;
+      rows: WriteProposalRow[];
+      expiresAt: number;
     }
   | {
       type: "board_update";

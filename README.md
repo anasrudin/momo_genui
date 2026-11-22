@@ -167,6 +167,31 @@ Set `MOMO_MCP_COMMAND` to a stdio MCP server (for example `/usr/local/bin/ubuntu
 
 Built-in tools stay off (`--tools ""`), and the server is started with `UBUNTU_MCP_READONLY=1` always and `UBUNTU_MCP_PRIVATE` only when Momo's own environment sets it. With no `MOMO_MCP_COMMAND`, or when the server offers nothing, the arguments are the plain text-generator ones. The Gemini CLI gets no tools.
 
+## Recording in FamHub, with confirmation (optional, off by default)
+
+Momo can put a transaction or a recurring bill into [FamHub](https://github.com/anasrudin/FamHub) from a chat ("catat belanja 150 ribu dari kas keluarga", "tambah tagihan listrik 500 ribu tiap tanggal 25"). The model can only **propose**: nothing is written until a person presses **Simpan** on the card in the thread.
+
+The feature exists only when all four are set (read at run time, restart after changing them):
+
+| Variable | Meaning |
+|---|---|
+| `MOMO_FAMHUB_WRITE=1` | The switch. Anything other than `1` is off. |
+| `MOMO_FAMHUB_URL` | FamHub's base URL, e.g. `http://127.0.0.1:3110`. |
+| `MOMO_FAMHUB_MEMBER` | Name of the FamHub member Momo writes as. Must be a parent (`admin`) there; the name is resolved to an id through `GET /api/family`. |
+| `MOMO_PASSWORD` | The login. A write feature is never reachable without it. |
+
+With any of them missing the tool is not declared to the model and `/api/famhub/confirm` and `/api/famhub/cancel` answer `404`. If the member does not resolve to exactly one parent, or FamHub cannot be read, the feature is off for that turn and the server log says why (`[momo] FamHub write is OFF: …`).
+
+How one write goes:
+
+1. The model calls `famhub_propose` with structured arguments. `transaction`: `wallet` (a wallet name), `direction` (`out`/`in`), `amount`, optional `category`, `note`, `date`. `bill`: `name`, `amount`, `dayOfMonth` (1..28), optional `category`. Money is whole rupiah. The server parses no free text.
+2. `/api/brain` validates them (`src/lib/famhub/writeProposals.ts`): the wallet name must match exactly one FamHub wallet, the amount must be a whole number above 0, the category one FamHub offers a parent (`groceries`, `bills`, `transport`, `education`, `health`, `home`, `fun`, `allowance`, `other`), the date a real `YYYY-MM-DD` (default: today). A refusal goes back to the model as a tool error it relays. FamHub's write API is not called here.
+3. A valid proposal becomes one of FamHub's own actions (`transaction/add` with a signed amount, negative for an expense; or `bill/add`), is kept in memory under a random id for 10 minutes, and is sent to the browser as a `write_proposal` SSE event carrying the id and the rows to show, never the action.
+4. The thread shows the card **Catat ke FamHub?** with those rows and **Simpan** / **Batal**. `POST /api/famhub/confirm { id }` sends exactly the stored action to FamHub's `POST /api/family/actions` as the configured member and returns FamHub's answer; `POST /api/famhub/cancel { id }` drops it. Both need the session (`401` without) and take only the id, so what is written is what was shown. An id works once: unknown, expired, cancelled and already used ids get `410`. A failed write also spends the id; ask again for a new proposal.
+5. The card ends as **Tersimpan ke FamHub**, **Dibatalkan**, **Kedaluwarsa, tidak disimpan** or the error text. That outcome is stored with the turn, so after a reload it is a record, not a button; a card still waiting after a reload stops being pressable when its 10 minutes are over, and the server refuses its id anyway (also after a restart, which forgets all pending proposals). The outcome is also added to the history the model sees, so a later "sudah kecatat?" gets the real answer.
+
+Limits: offered to Gemini API and `router-*` models, in the Chat workspace only. `claude-cli-*` and `gemini-cli` models are never offered the tool (they do not run Momo's tool loop), and Explore does not render the card. Only these two actions exist; there is no edit, delete or "pay bill". FamHub itself does not validate a bill's fields, so the checks above are the only ones a bill gets.
+
 ## Password login (optional)
 
 Without a login, anyone who can reach the server spends the owner's model accounts and can read whatever the MCP tools read. Set `MOMO_PASSWORD` to put one shared password in front of everything:

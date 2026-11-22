@@ -72,6 +72,7 @@ import {
 } from "@/lib/roleWorkspaceRegistry";
 import { extractMistlineBoardDrafts } from "@/lib/mistlineCatalog";
 import { recordVerifiedImageUrls, repairImageUrlsInText } from "@/lib/verifiedImagePool";
+import type { WriteProposalCard } from "@/lib/famhub/proposalCard";
 import { planMistlineSpreads } from "@/components/genui/MistlineSpreads";
 import { BlinkingSquares } from "@/components/ambient/BlinkingSquares";
 import {
@@ -626,6 +627,18 @@ function reduceBotMessageWithSse(
       return {
         ...msg,
         sources: ev.sources,
+      };
+    }
+
+    case "write_proposal": {
+      const existing = msg.writeProposals ?? [];
+      if (existing.some((c) => c.id === ev.id)) return msg;
+      return {
+        ...msg,
+        writeProposals: [
+          ...existing,
+          { id: ev.id, title: ev.title, rows: ev.rows, expiresAt: ev.expiresAt, status: "pending" },
+        ],
       };
     }
 
@@ -1983,6 +1996,28 @@ export const MomoAppShell: React.FC = () => {
       );
     },
     [],
+  );
+
+  // The outcome of a FamHub proposal card (saved, cancelled, expired, failed) is kept on its turn,
+  // so a reload shows the record instead of a card that could be pressed again.
+  const handleWriteProposalChange = useCallback(
+    (msgId: string, proposalId: string, patch: Pick<WriteProposalCard, "status" | "error">) => {
+      const sid = activeSessionIdRef.current;
+      if (!sid) return;
+      updateSessionMessages(sid, (prev) =>
+        prev.map((m) =>
+          m.id === msgId && m.writeProposals
+            ? {
+                ...m,
+                writeProposals: m.writeProposals.map((c) =>
+                  c.id === proposalId ? { ...c, status: patch.status, error: patch.error } : c,
+                ),
+              }
+            : m,
+        ),
+      );
+    },
+    [updateSessionMessages],
   );
 
   const handleTogglePinItem = useCallback(
@@ -5206,6 +5241,7 @@ export const MomoAppShell: React.FC = () => {
                         onAvatarSwitchRole={handleSelectBot}
                         pinnedTitles={pinnedTitles}
                         onTogglePinItem={handleTogglePinItem}
+                        onWriteProposalChange={handleWriteProposalChange}
                       />
                       </BoardItemStateContext.Provider>
                     </React.Fragment>

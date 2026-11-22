@@ -41,6 +41,17 @@ import {
 } from "@/lib/modelCatalog";
 import { streamFromLocalProvider, titleFromRouter } from "@/lib/providers/localProviders";
 import { appToolsDirective, callMcpTool, listMcpTools, toGeminiDeclaration } from "@/lib/providers/mcpTools";
+import {
+  FAMHUB_PROPOSE_TOOL,
+  buildProposal,
+  famhubProposeDeclaration,
+  famhubTurnReminder,
+  famhubWriteConfig,
+  famhubWriteDirective,
+  loadFamhubContext,
+  proposalStore,
+  proposalToolResponse,
+} from "@/lib/famhub/writeProposals";
 import { getRoleWorkspaceConfig } from "@/lib/roleWorkspaceRegistry";
 import { isUsableArticleImageUrl } from "@/lib/imageAssetContract";
 import {
@@ -256,7 +267,7 @@ function readProjectEnvLocal(): Record<string, string> {
 /**
  * Collapses whitespace and truncates long status/query labels cleanly at word boundaries.
  */
-const KNOWN_TOOL_NAMES = new Set(["web_search", "search_images", "sync_workspace_board"]);
+const KNOWN_TOOL_NAMES = new Set(["web_search", "search_images", "sync_workspace_board", FAMHUB_PROPOSE_TOOL]);
 
 /** Models occasionally garble a tool name ("search_search", "image_search"); route it instead of wasting a step. */
 function normalizeToolName(raw: string): string {
@@ -381,6 +392,7 @@ function buildBaseGeminiContents(opts: {
   rawMessages: IncomingTurnMessage[];
   latestUserText: string;
   dynamicGuidance: string;
+  trailingGuidance?: string;
   textAttachmentContext: string;
   imageAttachments: IncomingAttachment[];
 }): GeminiContent[] {
@@ -416,7 +428,7 @@ function buildBaseGeminiContents(opts: {
     .map((p) => (typeof p.text === "string" ? p.text : ""))
     .filter(Boolean)
     .join("\n\n");
-  const augmented = `<internal_turn_context do_not_echo="true">\n${opts.dynamicGuidance}\n</internal_turn_context>\n\n${baseText || opts.latestUserText}${opts.textAttachmentContext}`;
+  const augmented = `<internal_turn_context do_not_echo="true">\n${opts.dynamicGuidance}\n</internal_turn_context>\n\n${baseText || opts.latestUserText}${opts.textAttachmentContext}${opts.trailingGuidance ? `\n\n<internal_turn_context do_not_echo="true">\n${opts.trailingGuidance}\n</internal_turn_context>` : ""}`;
   const parts: GeminiPart[] = [{ text: augmented }];
 
   for (const img of opts.imageAttachments.slice(0, 4)) {
@@ -543,6 +555,19 @@ export async function POST(request: Request) {
   const appToolNames = new Set(appTools.map((t) => t.name));
   const functionDeclarations = [...GEMINI_FUNCTION_DECLARATIONS, ...appTools.map(toGeminiDeclaration)];
   const appDirective = appToolsDirective(appTools);
+  // Proposing a FamHub write: only when the feature is fully configured (flag, URL, member, login
+  // password), only in the chat thread (where the confirmation card is rendered), and only for
+  // models that go through this route's tool loop (the CLIs never see Momo's own tools).
+  const famhubConfig = (body.workspaceView || "chat") === "chat" ? famhubWriteConfig() : null;
+  const famhubCtx = famhubConfig ? await loadFamhubContext(famhubConfig) : null;
+  const famhubFor = (modelId: string) => {
+    if (!famhubCtx) return null;
+    const provider = providerOf(resolveModelMeta(modelId));
+    return provider === "gemini" || provider === "router" ? famhubCtx : null;
+  };
+  // first in the list: last, behind ten other tools, the model answered in text instead of calling it
+  const famhubDeclarations = famhubCtx ? [famhubProposeDeclaration(famhubCtx), ...functionDeclarations] : functionDeclarations;
+  const famhubDirective = famhubCtx ? famhubWriteDirective(famhubCtx) : "";
   const apiKeys = resolveGeminiApiKeys(projectEnv);
   const apiKey = apiKeys[0] || "";
   const rawPreferred = (
@@ -754,6 +779,8 @@ export async function POST(request: Request) {
         rawMessages,
         latestUserText,
         dynamicGuidance,
+        // after the user's text: ahead of it, among the UI directives, the model ignored it
+        trailingGuidance: famhubFor(selectedModelMeta.id) ? famhubTurnReminder() : "",
         textAttachmentContext,
         imageAttachments,
       });
@@ -866,17 +893,24 @@ export async function POST(request: Request) {
 
         const effectiveNativeGoogle =
           allowTools && includeNativeGoogleSearch && !forceFunctionCall;
+        const famhubOn = Boolean(famhubFor(modelId));
+        const stepDeclarations = famhubOn ? famhubDeclarations : functionDeclarations;
+        const systemText = `${activeStaticSystemPrompt}${appDirective}${famhubOn ? famhubDirective : ""}`;
+        // a forced search step must still let the model propose instead of searching
+        const forcedNames = famhubOn
+          ? ["web_search", "search_images", FAMHUB_PROPOSE_TOOL]
+          : ["web_search", "search_images"];
         const toolsSpec = allowTools
           ? effectiveNativeGoogle
             ? [
                 { google_search: {} },
-                { functionDeclarations },
+                { functionDeclarations: stepDeclarations },
               ]
-            : [{ functionDeclarations }]
+            : [{ functionDeclarations: stepDeclarations }]
           : undefined;
 
         const payload: Record<string, unknown> = {
-          systemInstruction: { parts: [{ text: `${activeStaticSystemPrompt}${appDirective}` }] },
+          systemInstruction: { parts: [{ text: systemText }] },
           contents: cleanGeminiContents,
           generationConfig: {
             temperature: turnTemperature,
@@ -893,7 +927,7 @@ export async function POST(request: Request) {
                 toolConfig: {
                   functionCallingConfig: {
                     mode: "ANY",
-                    allowedFunctionNames: ["web_search", "search_images"],
+                    allowedFunctionNames: forcedNames,
                   },
                 },
               }
@@ -907,12 +941,12 @@ export async function POST(request: Request) {
           const res = await streamFromLocalProvider(
             local,
             {
-              systemInstruction: { parts: [{ text: `${activeStaticSystemPrompt}${appDirective}` }] },
+              systemInstruction: { parts: [{ text: systemText }] },
               contents: contentsToSend,
               generationConfig: { temperature: turnTemperature, maxOutputTokens: maxOut },
               tools: toolsSpec,
               ...(allowTools && forceFunctionCall
-                ? { toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["web_search", "search_images"] } } }
+                ? { toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: forcedNames } } }
                 : {}),
             },
             request.signal,
@@ -1484,6 +1518,8 @@ export async function POST(request: Request) {
                       ? "Mencari foto kontekstual"
                       : fnName === "sync_workspace_board"
                         ? `Menyelaraskan ${cfg.boardLabel}`
+                        : fnName === FAMHUB_PROPOSE_TOOL
+                          ? "Menyiapkan usulan untuk FamHub"
                         : appToolNames.has(fnName)
                           ? `Membaca data lokal: ${fnName}`
                           : "Memverifikasi konteks";
@@ -1956,6 +1992,40 @@ export async function POST(request: Request) {
                         columnsCount: cols.length,
                         itemsCount: items.length,
                       },
+                    },
+                  };
+                }
+
+                // Proposing only: validate, keep the action server-side, show the card.
+                // FamHub's write API is NOT called here; `/api/famhub/confirm` does that.
+                const famhub = effectiveName === FAMHUB_PROPOSE_TOOL ? famhubFor(activeModelId) : null;
+                if (famhub) {
+                  const built = buildProposal(tc.args, famhub);
+                  if (built.ok) {
+                    const { id, expiresAt } = proposalStore().put(built.proposal);
+                    send({
+                      type: "write_proposal",
+                      id,
+                      kind: built.proposal.kind,
+                      title: built.proposal.title,
+                      rows: built.proposal.rows,
+                      expiresAt,
+                    });
+                  }
+                  send({
+                    type: "tool_result",
+                    toolCallId: tc.id,
+                    name: effectiveName,
+                    summary: built.ok ? "Menunggu konfirmasi pengguna" : "Usulan ditolak",
+                    elapsedMs: Math.max(80, Date.now() - tc.startedAt),
+                  });
+                  return {
+                    functionResponse: {
+                      id: tc.id,
+                      name: effectiveName,
+                      response: built.ok
+                        ? proposalToolResponse(built.proposal)
+                        : { error: built.error, recorded: false, note: "Nothing was proposed or recorded. Tell the user why, or ask for the missing detail." },
                     },
                   };
                 }
