@@ -11,6 +11,6 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 ## Verification
 
 - Type-check: `npx tsc --noEmit` (no ESLint in this project).
-- Unit tests: `npx tsx --test $(find src -name '*.test.ts')` (110 tests).
+- Unit tests: `npx tsx --test $(find src -name '*.test.ts')` (126 tests).
 - GenUI: every component and variant is rendered at `/playground` (dev server on `127.0.0.1:4173`); check both `data-theme` values.
 - GenUI CSS (`mistline-genui.css`, `intelligence.css`, `intel-dataviz.css`) carries no `transition`; state changes go through `motion/react` (`StateMotion.tsx`). Only loading shimmers and spinners are CSS keyframes.

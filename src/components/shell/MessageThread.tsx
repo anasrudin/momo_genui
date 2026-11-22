@@ -22,6 +22,8 @@ import { BotMenuPopover } from "@/components/shell/BotPopovers";
 import { MarkdownMessage } from "@/components/shell/MarkdownMessage";
 import { SourcePillRow } from "@/components/shell/SourcePillRow";
 import { MomoThinkingProcess } from "@/components/shell/MomoThinkingProcess";
+import { FamhubProposalCard } from "@/components/shell/FamhubProposalCard";
+import type { WriteProposalCard } from "@/lib/famhub/proposalCard";
 import { LOOK_NAMES } from "@/data/looks";
 import type {
   BotIdentity,
@@ -67,6 +69,7 @@ export interface MessageThreadProps {
   onAvatarSwitchRole?: (targetBotId: string) => void;
   pinnedTitles?: Set<string>;
   onTogglePinItem?: (item: Omit<WorkspaceBoardItem, "id" | "columnId">) => void;
+  onWriteProposalChange?: (msgId: string, proposalId: string, patch: Pick<WriteProposalCard, "status" | "error">) => void;
 }
 
 const SystemMessageItem = memo<{ msg: ChatMessage }>(function SystemMessageItem({
@@ -364,6 +367,7 @@ const BotMessageItem = memo<{
   onAvatarSwitchRole?: (targetBotId: string) => void;
   pinnedTitles?: Set<string>;
   onTogglePinItem?: (item: Omit<WorkspaceBoardItem, "id" | "columnId">) => void;
+  onWriteProposalChange?: (msgId: string, proposalId: string, patch: Pick<WriteProposalCard, "status" | "error">) => void;
 }>(function BotMessageItem({
   msg,
   userContextText,
@@ -385,6 +389,7 @@ const BotMessageItem = memo<{
   onAvatarSwitchRole,
   pinnedTitles,
   onTogglePinItem,
+  onWriteProposalChange,
 }) {
   const [everStreamed, setEverStreamed] = useState(Boolean(msg.streaming));
   const [streamedInPlace, setStreamedInPlace] = useState(Boolean(msg.streaming));
@@ -447,6 +452,13 @@ const BotMessageItem = memo<{
       parts.some((p) => p.kind === "tool" || p.kind === "gen_ui") ||
       (msg.role === "momo" &&
         (hasVisibleOutput || Boolean(msg.tokenCount || msg.elapsedSec)))
+  );
+
+  const msgId = msg.id;
+  const handleProposalChange = useCallback(
+    (proposalId: string, patch: Pick<WriteProposalCard, "status" | "error">) =>
+      onWriteProposalChange?.(msgId, proposalId, patch),
+    [msgId, onWriteProposalChange],
   );
 
   const roleTint = useMemo(() => roleTintVars(pal), [pal]);
@@ -816,6 +828,14 @@ const BotMessageItem = memo<{
           )}
         </AnimatePresence>
 
+        {msg.writeProposals && msg.writeProposals.length > 0 && (
+          <div className="momo-famhub-cards">
+            {msg.writeProposals.map((card) => (
+              <FamhubProposalCard key={card.id} card={card} onChange={handleProposalChange} />
+            ))}
+          </div>
+        )}
+
         {msg.truncated && !msg.streaming && (
           <p
             className="gu-pen momo-hand-title"
@@ -937,6 +957,7 @@ export const MessageThread = React.forwardRef<HTMLDivElement, MessageThreadProps
       onAvatarSwitchRole,
       pinnedTitles,
       onTogglePinItem,
+      onWriteProposalChange,
     },
     forwardedRef
   ) {
@@ -1065,6 +1086,7 @@ export const MessageThread = React.forwardRef<HTMLDivElement, MessageThreadProps
         onAvatarSwitchRole={onAvatarSwitchRole}
         pinnedTitles={pinnedTitles}
         onTogglePinItem={onTogglePinItem}
+        onWriteProposalChange={onWriteProposalChange}
       />
     );
   });

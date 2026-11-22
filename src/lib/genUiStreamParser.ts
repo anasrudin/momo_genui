@@ -1,3 +1,4 @@
+import { proposalHistoryLine, type WriteProposalCard } from "./famhub/proposalCard";
 import { type MistlineUIBlock } from "./mistlineParse";
 import { parseMixedStreamToMistlineBlocks } from "./openui/streamParser";
 
@@ -109,7 +110,10 @@ export function serializeMessageForHistory(m: {
         blocks?: Array<{ spec?: unknown; html?: string }>;
       }
   >;
+  writeProposals?: WriteProposalCard[];
 }): string {
+  // what became of each FamHub proposal, so the model never has to guess whether one was saved
+  const proposalLines = (m.writeProposals ?? []).map((c) => proposalHistoryLine(c));
   if (m.parts && m.parts.length > 0) {
     const segments: string[] = [];
     for (const p of m.parts) {
@@ -126,10 +130,10 @@ export function serializeMessageForHistory(m: {
       }
     }
     if (segments.length > 0) {
-      return segments.join("\n\n");
+      return [...segments, ...proposalLines].join("\n\n");
     }
   }
-  return compressUiBlocksForHistory(m.text || "");
+  return [compressUiBlocksForHistory(m.text || ""), ...proposalLines].filter(Boolean).join("\n\n");
 }
 
 function summarizeUiBlockForHistory(block: MistlineUIBlock): string {
