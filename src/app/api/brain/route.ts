@@ -34,9 +34,12 @@ import { hydrateBoardItemsMedia } from "@/lib/mediaResolver";
 import {
   MOMO_MODEL_CATALOG,
   normalizeReasoningEffort,
+  providerOf,
   resolveModelMeta,
+  type MomoModelOption,
   type ReasoningEffort,
 } from "@/lib/modelCatalog";
+import { streamFromLocalProvider, titleFromRouter } from "@/lib/providers/localProviders";
 import { getRoleWorkspaceConfig } from "@/lib/roleWorkspaceRegistry";
 import { isUsableArticleImageUrl } from "@/lib/imageAssetContract";
 import {
@@ -432,16 +435,26 @@ function buildBaseGeminiContents(opts: {
   return list;
 }
 
+/** An enabled model that is not served by the Gemini API (router or CLI on this machine). */
+function localModel(modelId: string): MomoModelOption | undefined {
+  return MOMO_MODEL_CATALOG.find((m) => m.id === modelId && providerOf(m) !== "gemini");
+}
+
 function getOrderedCandidateModels(
   preferred: string,
-  hasExplicitModelId = false
+  hasExplicitModelId = false,
+  hasGeminiKey = true
 ): string[] {
   const cleanPreferred = preferred.replace(/^[a-z]+\//i, "").trim();
   const ordered = [
     ...(cleanPreferred ? [cleanPreferred] : []),
     MOMO_MODEL_CATALOG[0].id,
+    // the other local models are fallbacks too; Gemini API ones only count with a key
+    ...MOMO_MODEL_CATALOG.filter((m) => providerOf(m) !== "gemini").map((m) => m.id),
     ...DEFAULT_MODEL_CANDIDATES,
-  ].map((m) => m.replace(/^[a-z]+\//i, "").trim());
+  ]
+    .map((m) => m.replace(/^[a-z]+\//i, "").trim())
+    .filter((m) => hasGeminiKey || Boolean(localModel(m)));
 
   const unique: string[] = [];
   for (const m of ordered) {
@@ -451,7 +464,7 @@ function getOrderedCandidateModels(
   const pool = healthy.length > 0 ? healthy : unique;
   if (hasExplicitModelId && cleanPreferred) {
     // Always try the user's explicitly chosen model first even if it was recently throttled
-    return [cleanPreferred, ...pool.filter((m) => m !== cleanPreferred)];
+    return [...new Set([cleanPreferred, ...pool])].filter((m) => hasGeminiKey || Boolean(localModel(m)));
   }
   return pool;
 }
@@ -577,7 +590,8 @@ export async function POST(request: Request) {
         reasoningEffort: resolvedEffort,
       });
 
-      if (!apiKey) {
+      const firstRouterModel = MOMO_MODEL_CATALOG.find((m) => providerOf(m) === "router");
+      if (!apiKey && !MOMO_MODEL_CATALOG.some((m) => providerOf(m) !== "gemini")) {
         send({
           type: "turn_error",
           message:
@@ -588,7 +602,12 @@ export async function POST(request: Request) {
       }
 
       const titlePromise = body.needsTitle
-        ? generateSessionTitle(latestUserText, getRotatedGeminiKeys(apiKeys), request.signal).then(
+        ? (apiKey
+            ? generateSessionTitle(latestUserText, getRotatedGeminiKeys(apiKeys), request.signal)
+            : firstRouterModel
+              ? titleFromRouter(latestUserText, firstRouterModel.upstreamId ?? firstRouterModel.id, request.signal)
+              : Promise.resolve(null)
+          ).then(
             (title) => {
               if (title) send({ type: "session_title", title });
             },
@@ -738,7 +757,7 @@ export async function POST(request: Request) {
       }));
 
       const hasExplicitModel = Boolean(body.modelId && body.modelId.trim());
-      const modelList = getOrderedCandidateModels(preferredModel, hasExplicitModel);
+      const modelList = getOrderedCandidateModels(preferredModel, hasExplicitModel, Boolean(apiKey));
       const turnSuffix = crypto.randomUUID().slice(0, 8);
       const turnStartMs = Date.now();
       let partCounter = 0;
@@ -874,6 +893,26 @@ export async function POST(request: Request) {
               }
             : {}),
         };
+
+        const local = localModel(modelId);
+        if (local) {
+          // Same request, answered by the router or a CLI on this machine; the
+          // reply comes back as Gemini SSE, so everything below stays as it is.
+          const res = await streamFromLocalProvider(
+            local,
+            {
+              systemInstruction: { parts: [{ text: activeStaticSystemPrompt }] },
+              contents: contentsToSend,
+              generationConfig: { temperature: turnTemperature, maxOutputTokens: maxOut },
+              tools: toolsSpec,
+              ...(allowTools && forceFunctionCall
+                ? { toolConfig: { functionCallingConfig: { mode: "ANY", allowedFunctionNames: ["web_search", "search_images"] } } }
+                : {}),
+            },
+            request.signal,
+          );
+          return { res, usedModel: modelId, useReasoning: false };
+        }
 
         const res = await fetch(endpoint, {
           method: "POST",
@@ -1158,7 +1197,8 @@ export async function POST(request: Request) {
             }
 
             try {
-              const orderedKeys = getRotatedGeminiKeys(apiKeys);
+              // a local model needs no Gemini key: one attempt, with an empty placeholder
+              const orderedKeys = localModel(candidate) ? [""] : getRotatedGeminiKeys(apiKeys);
               let modelSucceeded = false;
               let hadNonAuthModelFailure = false;
 
@@ -1236,7 +1276,7 @@ export async function POST(request: Request) {
                   attempt.res.status === 500 ||
                   attempt.res.status === 503
                 ) {
-                  markGeminiKeyCooldown(candKey, attempt.res.status);
+                  if (candKey) markGeminiKeyCooldown(candKey, attempt.res.status);
                 }
                 if (
                   attempt.res.status === 429 ||

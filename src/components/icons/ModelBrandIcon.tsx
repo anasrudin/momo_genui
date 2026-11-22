@@ -139,6 +139,30 @@ export const ModelBrandIcon: React.FC<{
           />
         </svg>
       );
+
+    case "anthropic":
+      // a plain eight-ray burst, not a trademark
+      return (
+        <svg
+          width={size}
+          height={size}
+          viewBox="0 0 24 24"
+          fill="none"
+          aria-hidden="true"
+          style={{
+            color: active ? "#c96442" : "currentColor",
+            transition: "color 0.2s ease",
+            flexShrink: 0,
+          }}
+        >
+          <path
+            stroke="currentColor"
+            strokeWidth="2.2"
+            strokeLinecap="round"
+            d="M12 3v18M3 12h18M5.6 5.6l12.8 12.8M18.4 5.6 5.6 18.4"
+          />
+        </svg>
+      );
   }
 };
 

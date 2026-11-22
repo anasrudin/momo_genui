@@ -140,10 +140,27 @@ A built-in design workbench that mounts every registered component against live 
 
 4. Open the app at `http://127.0.0.1:4173` or inspect all GenUI components at `http://127.0.0.1:4173/playground`.
 
+## Local backends (no Gemini API key)
+
+Momo can answer from what is already signed in on the machine it runs on. Set `NEXT_PUBLIC_MOMO_MODELS` in `.env.local` (see `.env.example`), then rebuild.
+
+| Model id | Backend | Tools (web/image search, Pinboard) | Images in |
+|---|---|---|---|
+| `router-*` | OpenAI-compatible router such as 9router (`MOMO_ROUTER_URL`) | yes | yes |
+| `claude-cli-*` | `claude -p`, headless, on the machine user's Claude login | no; a required search step is run by Momo itself | yes |
+| `gemini-cli` | `gemini -p`, headless, on the machine user's Gemini login | same as above | no |
+
+How it works: `src/lib/providers/geminiBridge.ts` turns the route's Gemini request into a chat-completions request or a CLI prompt, and turns the reply back into Gemini SSE, so `/api/brain` keeps its parser, tool loop and retries. `src/lib/providers/localProviders.ts` does the fetching and spawning.
+
+The CLIs run as plain text generators: an empty working directory, no built-in tools, no MCP servers, no user settings or hooks, no saved session. Web grounding still needs `TINYFISH_API_KEY`, `EXA_API_KEY` or `FIRECRAWL_API_KEY`; without them searches come back empty and the model says so.
+
+There is no login. Anyone who can reach the server spends the owner's model accounts, so keep it on loopback or a trusted LAN.
+
 ## Verification
 
 ```bash
 npm run typecheck
+npx tsx --test $(find src -name '*.test.ts')
 npm run build
 ```
 
